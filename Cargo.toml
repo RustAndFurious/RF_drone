@@ -1,0 +1,10 @@
+[package]
+name = "RF_drone"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = ["creates/rf_drone"]
+
+[dependencies]
+rf_drone = { path = "creates/rf_drone" }
