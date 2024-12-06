@@ -1,4 +1,4 @@
-use crossbeam_channel::{select_biased, Receiver, SendError, Sender};
+use crossbeam_channel::{select_biased, Receiver, Sender};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use rand::{rng, Rng};
@@ -92,7 +92,7 @@ impl RustAndFurious {
                         Ok((packet, sender)) => {
                             if rng().random_bool(self.pdr as f64) {
                                 self.send_nack(packet.clone(), NackType::Dropped);
-                                self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::PacketDropped(packet)));
+                                self.controller_send.send(DroneEvent::PacketDropped(packet)).expect("controller_send channel closed but drone isn't crashed")
                             } else {
                                 self.forward_packet(packet, sender);
                             }
@@ -107,20 +107,20 @@ impl RustAndFurious {
             PacketType::Nack(ref _nack) => {
                 match self.perform_packet_checks(packet) {
                     Ok((packet, sender)) => self.forward_packet(packet, sender),
-                    Err((packet, _)) => self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::ControllerShortcut(packet)))
+                    Err((packet, _)) => self.controller_send.send(DroneEvent::ControllerShortcut(packet)).expect("controller_send channel closed but drone isn't crashed")
                 }
             },
             PacketType::Ack(ref _ack) => {
                 match self.perform_packet_checks(packet) {
                     Ok((packet, sender)) => self.forward_packet(packet, sender),
-                    Err((packet, _)) => self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::ControllerShortcut(packet)))
+                    Err((packet, _)) => self.controller_send.send(DroneEvent::ControllerShortcut(packet)).expect("controller_send channel closed but drone isn't crashed")
                 }
             },
             PacketType::FloodRequest(flood_request) => if !self.is_in_crash_behaviour { self.handle_flood_request(flood_request) },
             PacketType::FloodResponse(ref _flood_response) => {
                 match self.perform_packet_checks(packet) {
                     Ok((packet, sender)) => self.forward_packet(packet, sender),
-                    Err((packet, _)) => self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::ControllerShortcut(packet)))
+                    Err((packet, _)) => self.controller_send.send(DroneEvent::ControllerShortcut(packet)).expect("controller_send channel closed but drone isn't crashed")
                 }
             }
         }
@@ -183,14 +183,14 @@ impl RustAndFurious {
             let nack_response = Packet::new_nack(routing_header, session_id, nack);
             self.forward_packet(nack_response, sender);
         } else { // the drone which sent that packet to the drone just crashed
-            self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::ControllerShortcut(packet)));
+            self.controller_send.send(DroneEvent::ControllerShortcut(packet)).expect("controller_send channel closed but drone isn't crashed");
         }
     }
 
     /// forwards the packet to the sender, without altering it
     fn forward_packet(&self, packet: Packet, sender: &Sender<Packet>) {
         match sender.send(packet.clone()) {
-            Ok(_) => self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::PacketSent(packet))),
+            Ok(_) => self.controller_send.send(DroneEvent::PacketSent(packet)).expect("controller_send channel closed but drone isn't crashed"),
             Err(error) => {
                 let packet = error.0;
                 match packet.pack_type {
@@ -198,10 +198,10 @@ impl RustAndFurious {
                         let nack_type = NackType::ErrorInRouting(packet.routing_header.hops[packet.routing_header.hop_index-1]);
                         self.send_nack(packet, nack_type);
                     },
-                    PacketType::Nack(ref _nack) => self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::ControllerShortcut(packet))),
-                    PacketType::Ack(ref _ack) => self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::ControllerShortcut(packet))),
+                    PacketType::Nack(ref _nack) => self.controller_send.send(DroneEvent::ControllerShortcut(packet)).expect("controller_send channel closed but drone isn't crashed"),
+                    PacketType::Ack(ref _ack) => self.controller_send.send(DroneEvent::ControllerShortcut(packet)).expect("controller_send channel closed but drone isn't crashed"),
                     PacketType::FloodRequest(flood_request) => self.generate_and_send_flood_response(flood_request),
-                    PacketType::FloodResponse(ref _flood_response) => self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::ControllerShortcut(packet)))
+                    PacketType::FloodResponse(ref _flood_response) => self.controller_send.send(DroneEvent::ControllerShortcut(packet)).expect("controller_send channel closed but drone isn't crashed")
                 }
             }
         }
@@ -213,7 +213,7 @@ impl RustAndFurious {
 
         let sender_op = self.packet_send.get(&packet.routing_header.hops[packet.routing_header.hop_index]);
         if sender_op.is_none() { // the drone which sent that packet to the drone just crashed
-            self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::ControllerShortcut(packet)));
+            self.controller_send.send(DroneEvent::ControllerShortcut(packet)).expect("controller_send channel closed but drone isn't crashed");
             return;
         }
         let sender = sender_op.unwrap();
@@ -243,14 +243,6 @@ impl RustAndFurious {
             if !flood_request_forwarded {
                 self.generate_and_send_flood_response(flood_request);
             }
-        }
-    }
-
-    /// execute the sending through controller_recv, panicking in case of an error
-    fn execute_send_to_controller_recv<T>(&self, send: Result<(), SendError<T>>) {
-        match send {
-            Ok(_) => {},
-            Err(_) => panic!("controller_send channel closed but drone isn't crashed")
         }
     }
 }
