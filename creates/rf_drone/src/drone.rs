@@ -64,7 +64,7 @@ impl Drone for RustAndFurious {
                     }
                 }
             } else {
-                match self.packet_recv.recv() {
+                match self.packet_recv.try_recv() {
                     Ok(packet) => {
                         self.process_packet(packet);
                     },
@@ -250,7 +250,32 @@ impl RustAndFurious {
 #[cfg(test)]
 mod drone_tests {
     use super::*;
-    use crossbeam_channel::unbounded;
+    use std::collections::HashMap;
+    use std::{fs, thread};
+    use crossbeam_channel::{unbounded, Receiver, Sender};
+    use wg_2024::config::Config;
+    use wg_2024::controller::{DroneCommand, DroneEvent};
+    use wg_2024::network::NodeId;
+    use wg_2024::tests as wg_tests;
+
+    const CONFIG_FILE_PATH: &str = "src/config.toml";
+
+    #[test]
+    fn wg_test1() {
+        wg_tests::generic_fragment_forward::<RustAndFurious>();
+    }
+    #[test]
+    fn wg_test2() {
+        wg_tests::generic_fragment_drop::<RustAndFurious>();
+    }
+    #[test]
+    fn wg_test3() {
+        wg_tests::generic_chain_fragment_drop::<RustAndFurious>();
+    }
+    #[test]
+    fn wg_test4() {
+        wg_tests::generic_chain_fragment_ack::<RustAndFurious>();
+    }
 
     fn get_test_drone() -> RustAndFurious {
         let id = rand::random::<u8>();
@@ -260,6 +285,10 @@ mod drone_tests {
         let packet_send = HashMap::new();
         let pdr = 1.0;
         RustAndFurious::new(id, controller_send, controller_recv, packet_recv, packet_send, pdr)
+    }
+    fn parse_config(file: &str) -> Config {
+        let file_str = fs::read_to_string(file).expect("Unable to read config file");
+        toml::from_str(&file_str).expect("Unable to parse TOML string data")
     }
 
     #[test]
@@ -288,5 +317,78 @@ mod drone_tests {
             }
         }
         println!("n°: {}", count);
+    }
+
+    #[test]
+    fn test_base() {
+        let config = parse_config(CONFIG_FILE_PATH);
+        //println!("Configuration read");
+
+        let mut controller_drones = HashMap::new();
+        let (node_event_send, node_event_recv) = unbounded();
+        //println!("SC channels configured");
+
+        let mut packet_channels = HashMap::new();
+        for drone in config.drone.iter() {
+            packet_channels.insert(drone.id, unbounded());
+        }
+        for client in config.client.iter() {
+            packet_channels.insert(client.id, unbounded());
+        }
+        for server in config.server.iter() {
+            packet_channels.insert(server.id, unbounded());
+        }
+        //println!("Configured packet channels");
+
+        let mut handles = Vec::new();
+        for drone in config.drone.into_iter() {
+            // controller
+            let (controller_drone_send, controller_drone_recv) = unbounded();
+            controller_drones.insert(drone.id, controller_drone_send);
+            let node_event_send = node_event_send.clone();
+            // packet
+            let packet_recv = packet_channels[&drone.id].1.clone();
+            let packet_send = drone
+                .connected_node_ids
+                .into_iter()
+                .map(|id| (id, packet_channels[&id].0.clone()))
+                .collect();
+
+            handles.push(thread::spawn(move || {
+                let mut drone = RustAndFurious::new(
+                    drone.id,
+                    node_event_send,
+                    controller_drone_recv,
+                    packet_recv,
+                    packet_send,
+                    drone.pdr,
+                );
+
+                drone.run();
+            }));
+        }
+        //println!("All drones have been configured");
+
+        let mut controller = SimulationController {
+            drones: controller_drones,
+            node_event_recv,
+        };
+        controller.crash_all();
+        //println!("Sent command to crash drones");
+
+        while let Some(handle) = handles.pop() {
+            handle.join().unwrap();
+        }
+    }
+    struct SimulationController {
+        drones: HashMap<NodeId, Sender<DroneCommand>>,
+        node_event_recv: Receiver<DroneEvent>,
+    }
+    impl SimulationController {
+        fn crash_all(&mut self) {
+            for (_, sender) in self.drones.iter() {
+                sender.send(DroneCommand::Crash).unwrap();
+            }
+        }
     }
 }

@@ -1,2 +1,7 @@
 /target
+
+# added to allow to build the project and compile it
 /src/main.rs
+
+# added to be used in tests
+/creates/rf_drone/src/config.toml
