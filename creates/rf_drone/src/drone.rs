@@ -1,4 +1,4 @@
-use crossbeam_channel::{select_biased, Receiver, Sender};
+use crossbeam_channel::{select_biased, Receiver, SendError, Sender};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use rand::{rng, Rng};
@@ -8,6 +8,7 @@ use wg_2024::drone::Drone;
 use wg_2024::network::{NodeId, SourceRoutingHeader};
 use wg_2024::packet::{FloodRequest, Nack, NackType, NodeType, Packet, PacketType};
 
+/// drone implementation of the Rust&Furious group
 pub struct RustAndFurious {
     // common data
     id: Arc<Mutex<NodeId>>,
@@ -18,7 +19,7 @@ pub struct RustAndFurious {
     pdr: f32,
 
     // group data
-    received_flood_ids: HashSet<u64>,
+    received_flood_ids: HashSet<(NodeId, u64)>,
     is_in_crash_behaviour: bool
 }
 
@@ -50,15 +51,15 @@ impl Drone for RustAndFurious {
                     recv(self.controller_recv) -> command => {
                         if let Ok(command) = command {
                             self.handle_command(command);
-                        } else {
-                            todo!()
+                        } else { // this shouldn't happen
+                            panic!("controller_recv channel closed but drone isn't crashed");
                         }
                     },
                     recv(self.packet_recv) -> packet => {
                         if let Ok(packet) = packet {
                             self.process_packet(packet);
-                        } else {
-                            todo!()
+                        } else { // this shouldn't happen
+                            panic!("packet_recv channel closed but drone isn't crashed");
                         }
                     }
                 }
@@ -91,7 +92,7 @@ impl RustAndFurious {
                         Ok((packet, sender)) => {
                             if rng().random_bool(self.pdr as f64) {
                                 self.send_nack(packet.clone(), NackType::Dropped);
-                                self.controller_send.send(DroneEvent::PacketDropped(packet)).unwrap();
+                                self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::PacketDropped(packet)));
                             } else {
                                 self.forward_packet(packet, sender);
                             }
@@ -106,26 +107,26 @@ impl RustAndFurious {
             PacketType::Nack(ref _nack) => {
                 match self.perform_packet_checks(packet) {
                     Ok((packet, sender)) => self.forward_packet(packet, sender),
-                    Err((packet, nack_type)) => self.send_nack(packet, nack_type)
+                    Err((packet, _)) => self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::ControllerShortcut(packet)))
                 }
             },
             PacketType::Ack(ref _ack) => {
                 match self.perform_packet_checks(packet) {
                     Ok((packet, sender)) => self.forward_packet(packet, sender),
-                    Err((packet, nack_type)) => self.send_nack(packet, nack_type)
+                    Err((packet, _)) => self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::ControllerShortcut(packet)))
                 }
             },
             PacketType::FloodRequest(flood_request) => if !self.is_in_crash_behaviour { self.handle_flood_request(flood_request) },
             PacketType::FloodResponse(ref _flood_response) => {
                 match self.perform_packet_checks(packet) {
                     Ok((packet, sender)) => self.forward_packet(packet, sender),
-                    Err((packet, nack_type)) => self.send_nack(packet, nack_type)
+                    Err((packet, _)) => self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::ControllerShortcut(packet)))
                 }
             }
         }
     }
 
-    // performs all the checks on the packet, as described by the protocol
+    /// performs all the checks on the packet, as described by the protocol
     fn perform_packet_checks(&self, mut packet: Packet) -> Result<(Packet, &Sender<Packet>), (Packet, NackType)> {
         // step 1
         if packet.routing_header.hops[packet.routing_header.hop_index] != *self.id.clone().lock().unwrap() {
@@ -156,7 +157,7 @@ impl RustAndFurious {
         Ok((packet, sender))
     }
 
-    // get the SourceRoutingHeader to send back the packet to the sender through the path it used
+    /// get the SourceRoutingHeader to send back the packet to the sender through the path it used
     fn get_backwards_source_routing_header(&self, original: SourceRoutingHeader) -> SourceRoutingHeader {
         let tmp = original.hops.split_at(original.hop_index).0;
         let mut hops = Vec::new();
@@ -167,9 +168,10 @@ impl RustAndFurious {
 
         SourceRoutingHeader::with_first_hop(hops)
     }
-    // sends back a Nack after an error occurred
+    /// sends back a Nack after an error occurred
     fn send_nack(&self, packet: Packet, nack_type: NackType) {
-        let sender_op = self.packet_send.get(&packet.routing_header.hops[packet.routing_header.hop_index-1]);
+        let sender_id = &packet.routing_header.hops[packet.routing_header.hop_index-1];
+        let sender_op = self.packet_send.get(sender_id);
         if let Some(sender) = sender_op {
             let nack = Nack {
                 fragment_index: 0,
@@ -179,16 +181,16 @@ impl RustAndFurious {
             let session_id = rand::random::<u64>();
 
             let nack_response = Packet::new_nack(routing_header, session_id, nack);
-            sender.send(nack_response).unwrap();
+            self.forward_packet(nack_response, sender);
         } else { // the drone which sent that packet to the drone just crashed
-            self.controller_send.send(DroneEvent::ControllerShortcut(packet)).unwrap(); // don't think this can Err if the SC works fine
+            self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::ControllerShortcut(packet)));
         }
     }
 
-    // forwards the packet normally
+    /// forwards the packet to the sender, without altering it
     fn forward_packet(&self, packet: Packet, sender: &Sender<Packet>) {
         match sender.send(packet.clone()) {
-            Ok(_) => self.controller_send.send(DroneEvent::PacketSent(packet)).unwrap(),
+            Ok(_) => self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::PacketSent(packet))),
             Err(error) => {
                 let packet = error.0;
                 match packet.pack_type {
@@ -196,10 +198,10 @@ impl RustAndFurious {
                         let nack_type = NackType::ErrorInRouting(packet.routing_header.hops[packet.routing_header.hop_index-1]);
                         self.send_nack(packet, nack_type);
                     },
-                    PacketType::Nack(ref _nack) => self.controller_send.send(DroneEvent::ControllerShortcut(packet)).unwrap(),
-                    PacketType::Ack(ref _ack) => self.controller_send.send(DroneEvent::ControllerShortcut(packet)).unwrap(),
+                    PacketType::Nack(ref _nack) => self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::ControllerShortcut(packet))),
+                    PacketType::Ack(ref _ack) => self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::ControllerShortcut(packet))),
                     PacketType::FloodRequest(flood_request) => self.generate_and_send_flood_response(flood_request),
-                    PacketType::FloodResponse(ref _flood_response) => self.controller_send.send(DroneEvent::ControllerShortcut(packet)).unwrap()
+                    PacketType::FloodResponse(ref _flood_response) => self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::ControllerShortcut(packet)))
                 }
             }
         }
@@ -211,21 +213,20 @@ impl RustAndFurious {
 
         let sender_op = self.packet_send.get(&packet.routing_header.hops[packet.routing_header.hop_index]);
         if sender_op.is_none() { // the drone which sent that packet to the drone just crashed
-            self.controller_send.send(DroneEvent::ControllerShortcut(packet)).unwrap();
+            self.execute_send_to_controller_recv(self.controller_send.send(DroneEvent::ControllerShortcut(packet)));
             return;
         }
         let sender = sender_op.unwrap();
 
-        sender.send(packet.clone()).unwrap();
-        self.controller_send.send(DroneEvent::PacketSent(packet)).unwrap();
+        self.forward_packet(packet.clone(), sender);
     }
     fn handle_flood_request(&mut self, mut flood_request: FloodRequest) {
-        if self.received_flood_ids.contains(&flood_request.flood_id) { // flood already passed through this drone
+        if self.received_flood_ids.contains(&(*self.id.clone().lock().unwrap(), flood_request.flood_id)) { // flood already passed through this drone
             flood_request.increment(*self.id.clone().lock().unwrap(), NodeType::Drone);
             self.generate_and_send_flood_response(flood_request);
         } else { // flood not yet passed through this drone
-            self.received_flood_ids.insert(flood_request.flood_id);
-            let last_flood_node = flood_request.path_trace.last().unwrap().0;
+            self.received_flood_ids.insert((*self.id.clone().lock().unwrap(), flood_request.flood_id));
+            let last_flood_node = flood_request.path_trace.last().unwrap().0; // in theory when the flood gets here there has to be at least one element (the flood initiator)
             flood_request.increment(*self.id.clone().lock().unwrap(), NodeType::Drone);
             let mut flood_request_forwarded = false;
 
@@ -234,8 +235,7 @@ impl RustAndFurious {
                 if *neighbor_id != last_flood_node {
                     flood_request_forwarded = true;
                     let packet = Packet::new_flood_request(SourceRoutingHeader::empty_route(), 0, flood_request.clone());
-                    neighbor_sender.send(packet.clone()).unwrap();
-                    self.controller_send.send(DroneEvent::PacketSent(packet)).unwrap();
+                    self.forward_packet(packet.clone(), neighbor_sender);
                 }
             }
 
@@ -245,16 +245,23 @@ impl RustAndFurious {
             }
         }
     }
+
+    /// execute the sending through controller_recv, panicking in case of an error
+    fn execute_send_to_controller_recv<T>(&self, send: Result<(), SendError<T>>) {
+        match send {
+            Ok(_) => {},
+            Err(_) => panic!("controller_send channel closed but drone isn't crashed")
+        }
+    }
 }
 
 #[cfg(test)]
 mod drone_tests {
     use super::*;
     use crossbeam_channel::unbounded;
-    use rand::rng;
 
     fn get_test_drone() -> RustAndFurious {
-        let id = 42u8;
+        let id = rand::random::<u8>();
         let (controller_send, _) = unbounded();
         let (_, controller_recv) = unbounded();
         let (_, packet_recv) = unbounded();
