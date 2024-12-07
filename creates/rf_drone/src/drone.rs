@@ -134,7 +134,7 @@ impl RustAndFurious {
                     Err((packet, _)) => self.controller_send.send(DroneEvent::ControllerShortcut(packet)).expect("controller_send channel closed but drone isn't crashed")
                 }
             },
-            PacketType::FloodRequest(flood_request) => if !self.is_in_crash_behaviour { self.handle_flood_request(flood_request) },
+            PacketType::FloodRequest(flood_request) => if !self.is_in_crash_behaviour { self.handle_flood_request(flood_request, packet.session_id) },
             PacketType::FloodResponse(ref _flood_response) => {
                 match self.perform_packet_checks(packet) {
                     Ok((packet, sender)) => self.forward_packet(packet, sender),
@@ -221,15 +221,15 @@ impl RustAndFurious {
                     },
                     PacketType::Nack(ref _nack) => self.controller_send.send(DroneEvent::ControllerShortcut(packet)).expect("controller_send channel closed but drone isn't crashed"),
                     PacketType::Ack(ref _ack) => self.controller_send.send(DroneEvent::ControllerShortcut(packet)).expect("controller_send channel closed but drone isn't crashed"),
-                    PacketType::FloodRequest(flood_request) => self.generate_and_send_flood_response(flood_request),
+                    PacketType::FloodRequest(flood_request) => self.generate_and_send_flood_response(flood_request, packet.session_id),
                     PacketType::FloodResponse(ref _flood_response) => self.controller_send.send(DroneEvent::ControllerShortcut(packet)).expect("controller_send channel closed but drone isn't crashed")
                 }
             }
         }
     }
 
-    fn generate_and_send_flood_response(&self, flood_request: FloodRequest) {
-        let mut packet = flood_request.generate_response(rand::random::<u64>());
+    fn generate_and_send_flood_response(&self, flood_request: FloodRequest, session_id: u64) {
+        let mut packet = flood_request.generate_response(session_id);
         packet.routing_header.increase_hop_index();
 
         let sender_op = self.packet_send.get(&packet.routing_header.hops[packet.routing_header.hop_index]);
@@ -241,19 +241,23 @@ impl RustAndFurious {
 
         self.forward_packet(packet.clone(), sender);
     }
-    fn handle_flood_request(&mut self, mut flood_request: FloodRequest) {
+    fn handle_flood_request(&mut self, mut flood_request: FloodRequest, session_id: u64) {
         if self.received_flood_ids.contains(&(*self.id.clone().lock().unwrap(), flood_request.flood_id)) { // flood already passed through this drone
             flood_request.increment(*self.id.clone().lock().unwrap(), NodeType::Drone);
-            self.generate_and_send_flood_response(flood_request);
+            self.generate_and_send_flood_response(flood_request, session_id);
         } else { // flood not yet passed through this drone
             self.received_flood_ids.insert((*self.id.clone().lock().unwrap(), flood_request.flood_id));
-            let last_flood_node = flood_request.path_trace.last().unwrap().0; // in theory when the flood gets here there has to be at least one element (the flood initiator)
+            let last_flood_node = match flood_request.path_trace.last() {
+                Some((node_id, _)) => node_id,
+                None => &flood_request.initiator_id
+            };
+            let mut flood_request = flood_request.clone();
             flood_request.increment(*self.id.clone().lock().unwrap(), NodeType::Drone);
             let mut flood_request_forwarded = false;
 
             // forward the flood request to other neighbors
             for (neighbor_id, neighbor_sender) in &self.packet_send {
-                if *neighbor_id != last_flood_node {
+                if neighbor_id != last_flood_node {
                     flood_request_forwarded = true;
                     let packet = Packet::new_flood_request(SourceRoutingHeader::empty_route(), 0, flood_request.clone());
                     self.forward_packet(packet.clone(), neighbor_sender);
@@ -262,7 +266,7 @@ impl RustAndFurious {
 
             // if there aren't any other neighbors
             if !flood_request_forwarded {
-                self.generate_and_send_flood_response(flood_request);
+                self.generate_and_send_flood_response(flood_request, session_id);
             }
         }
     }
@@ -278,19 +282,11 @@ mod drone_tests {
     use wg_2024::config::Config;
     use wg_2024::controller::{DroneCommand, DroneEvent};
     use wg_2024::network::NodeId;
-    use wg_2024::packet::{Ack, Fragment};
-    //use wg_2024::tests as wg_tests;
-
-    const CONFIG_FILE_PATH: &str = "src/config.toml";
-
-    //#[test] fn wg_test1() { wg_tests::generic_fragment_forward::<RustAndFurious>(); }
-    //#[test] fn wg_test2() { wg_tests::generic_fragment_drop::<RustAndFurious>(); }
-    //#[test] fn wg_test3() { wg_tests::generic_chain_fragment_drop::<RustAndFurious>(); }
-    //#[test] fn wg_test4() { wg_tests::generic_chain_fragment_ack::<RustAndFurious>(); }
+    use wg_2024::packet::{Ack, FloodResponse, Fragment};
 
     struct SimulationController {
         drones: HashMap<NodeId, Sender<DroneCommand>>,
-        node_event_recv: Receiver<DroneEvent>,
+        _node_event_recv: Receiver<DroneEvent>,
     }
     impl SimulationController {
         fn crash_all(&mut self) {
@@ -370,7 +366,7 @@ mod drone_tests {
 
     #[test]
     fn drones_crash() {
-        let config = parse_config(CONFIG_FILE_PATH);
+        let config = parse_config("src/test_configs/config_crash.toml");
 
         let mut controller_drones = HashMap::new();
         let (node_event_send, node_event_recv) = unbounded();
@@ -416,7 +412,7 @@ mod drone_tests {
 
         let controller = SimulationController {
             drones: controller_drones,
-            node_event_recv,
+            _node_event_recv: node_event_recv,
         };
 
         crash_drones_and_wait_join(controller, handles);
@@ -465,7 +461,7 @@ mod drone_tests {
 
         let controller = SimulationController {
             drones: controller_drones,
-            node_event_recv,
+            _node_event_recv: node_event_recv,
         };
         crash_drones_and_wait_join(controller, handles);
     }
@@ -523,12 +519,14 @@ mod drone_tests {
         // Client listens for packet from the drone (Dropped Nack)
         assert_eq!(c_recv.recv().unwrap(), nack_packet);
 
+        // controller receives the PacketDropped event
+        assert_eq!(node_event_recv.recv().unwrap(), DroneEvent::PacketDropped(msg));
         // controller receives the PacketSent event about the nack packet
         assert_eq!(node_event_recv.recv().unwrap(), DroneEvent::PacketSent(nack_packet));
 
         let controller = SimulationController {
             drones: controller_drones,
-            node_event_recv,
+            _node_event_recv: node_event_recv,
         };
         crash_drones_and_wait_join(controller, handles);
     }
@@ -616,7 +614,7 @@ mod drone_tests {
 
         let controller = SimulationController {
             drones: controller_drones,
-            node_event_recv,
+            _node_event_recv: node_event_recv,
         };
         crash_drones_and_wait_join(controller, handles);
     }
@@ -708,29 +706,188 @@ mod drone_tests {
 
         let controller = SimulationController {
             drones: controller_drones,
-            node_event_recv,
+            _node_event_recv: node_event_recv,
         };
         crash_drones_and_wait_join(controller, handles);
     }
 
-
-    /*fn forward_important_packet_trough_controller() {
-
-    }
-
-
-    fn flood() {
+    #[test]
+    fn forward_important_packet_trough_controller() {
         let mut controller_drones = HashMap::new();
         let (node_event_send, node_event_recv) = unbounded();
         let mut handles = Vec::new();
 
+        // drone <Packet>
+        let (d_send, d_recv) = unbounded();
+        // other casual drone
+        let (d_send2, _) = unbounded();
+        // SC commands
+        let (d_command_send, d_command_recv) = unbounded();
 
+        let neighbours = HashMap::from([(80, d_send2.clone())]);
+        controller_drones.insert(11, d_command_send);
+        let mut drone = RustAndFurious::new(
+            11,
+            node_event_send.clone(),
+            d_command_recv,
+            d_recv.clone(),
+            neighbours,
+            0.0,
+        );
+        // Spawn the drone's run method in a separate thread
+        handles.push(thread::spawn(move || {
+            drone.run();
+        }));
 
+        // packets to send through drone
+        let ack = Packet {
+            pack_type: PacketType::Ack(Ack { fragment_index: 1 }),
+            routing_header: SourceRoutingHeader {
+                hop_index: 1,
+                hops: vec![21, 12, 13, 1],
+            },
+            session_id: 16
+        };
+        let nack = Packet {
+            pack_type: PacketType::Nack(Nack {
+                fragment_index: 1,
+                nack_type: NackType::ErrorInRouting(41),
+            }),
+            routing_header: SourceRoutingHeader {
+                hop_index: 1,
+                hops: vec![12, 11, 1],
+            },
+            session_id: 5
+        };
+        let flood_response = Packet {
+            pack_type: PacketType::FloodResponse(FloodResponse {
+                flood_id: 0,
+                path_trace: vec![(12, NodeType::Drone), (15, NodeType::Drone), (16, NodeType::Drone), (13, NodeType::Drone), (49, NodeType::Drone), (7, NodeType::Drone), (14, NodeType::Server)],
+            }),
+            routing_header: SourceRoutingHeader {
+                hop_index: 5,
+                hops: vec![12, 15, 16, 13, 49, 7, 14],
+            },
+            session_id: 19
+        };
+
+        // sends the packets
+        d_send.send(ack.clone()).unwrap();
+        d_send.send(nack.clone()).unwrap();
+        d_send.send(flood_response.clone()).unwrap();
+
+        // controller should receive the packets as ControllerShortcut
+        assert_eq!(node_event_recv.recv().unwrap(), DroneEvent::ControllerShortcut(ack));
+        assert_eq!(node_event_recv.recv().unwrap(), DroneEvent::ControllerShortcut(nack));
+        assert_eq!(node_event_recv.recv().unwrap(), DroneEvent::ControllerShortcut(flood_response));
 
         let controller = SimulationController {
             drones: controller_drones,
-            node_event_recv,
+            _node_event_recv: node_event_recv,
         };
+
         crash_drones_and_wait_join(controller, handles);
-    }*/
+    }
+
+    #[test]
+    fn flood() {
+        let config = parse_config("src/test_configs/config_flood.toml");
+
+        let mut controller_drones = HashMap::new();
+        let (node_event_send, node_event_recv) = unbounded();
+
+        let mut packet_channels = HashMap::new();
+        for drone in config.drone.iter() {
+            packet_channels.insert(drone.id, unbounded());
+        }
+        for client in config.client.iter() {
+            packet_channels.insert(client.id, unbounded());
+        }
+        for server in config.server.iter() {
+            packet_channels.insert(server.id, unbounded());
+        }
+
+        let mut handles = Vec::new();
+        for drone in config.drone.into_iter() {
+            // controller
+            let (controller_drone_send, controller_drone_recv) = unbounded();
+            controller_drones.insert(drone.id, controller_drone_send);
+            let node_event_send = node_event_send.clone();
+            // packet
+            let packet_recv = packet_channels[&drone.id].1.clone();
+            let packet_send = drone
+                .connected_node_ids
+                .into_iter()
+                .map(|id| (id, packet_channels[&id].0.clone()))
+                .collect();
+
+            handles.push(thread::spawn(move || {
+                let mut drone = RustAndFurious::new(
+                    drone.id,
+                    node_event_send,
+                    controller_drone_recv,
+                    packet_recv,
+                    packet_send,
+                    drone.pdr,
+                );
+
+                drone.run();
+            }));
+        }
+
+        let controller = SimulationController {
+            drones: controller_drones,
+            _node_event_recv: node_event_recv,
+        };
+
+        // spawn thread for servers
+        let server_recv = packet_channels[&21].1.clone();
+        let drone_send = packet_channels[&4].0.clone();
+        handles.push(thread::spawn(move || {
+            let recv = server_recv.recv().unwrap();
+            assert!( match recv.clone().pack_type {
+                PacketType::FloodRequest(mut flood_request) => {
+                    flood_request.increment(21, NodeType::Server);
+                    let mut packet = flood_request.generate_response(recv.session_id);
+                    packet.routing_header.increase_hop_index();
+                    drone_send.send(packet).unwrap();
+                    true
+                },
+                _ => false
+            });
+        }));
+        let server_recv = packet_channels[&22].1.clone();
+        let drone_send = packet_channels[&3].0.clone();
+        handles.push(thread::spawn(move || {
+            let recv = server_recv.recv().unwrap();
+            assert!( match recv.clone().pack_type {
+                PacketType::FloodRequest(mut flood_request) => {
+                    flood_request.increment(22, NodeType::Server);
+                    let mut packet = flood_request.generate_response(recv.session_id);
+                    packet.routing_header.increase_hop_index();
+                    drone_send.send(packet).unwrap();
+                    true
+                },
+                _ => false
+            });
+        }));
+
+        // client sends the flood request to d1
+        let flood_request = Packet::new_flood_request(SourceRoutingHeader::empty_route(), rand::random::<u64>(), FloodRequest::new(rand::random::<u64>(), 11));
+        let drone_send = packet_channels[&1].0.clone();
+        drone_send.send(flood_request).unwrap();
+
+        // client receives two flood response with the paths to se two servers
+        let client_recv = packet_channels[&11].1.clone();
+        assert!(match client_recv.recv().unwrap().pack_type {
+            PacketType::FloodResponse(_) => true,
+            _ => false
+        });
+        assert!(match client_recv.recv().unwrap().pack_type {
+            PacketType::FloodResponse(_) => true,
+            _ => false
+        });
+
+        crash_drones_and_wait_join(controller, handles);
+    }
 }
