@@ -1,5 +1,6 @@
 use crossbeam_channel::{select_biased, Receiver, Sender};
 use std::collections::{HashMap, HashSet};
+use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, Mutex};
 use rand::{rng, Rng};
 
@@ -21,6 +22,22 @@ pub struct RustAndFurious {
     // group data
     received_flood_ids: HashSet<(NodeId, u64)>,
     is_in_crash_behaviour: bool
+}
+
+impl Debug for RustAndFurious {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let _ = f.debug_struct("RustAndFurious");
+        write!(f, " {{\nid: {}\nneighbor ids:", self.id.lock().unwrap()).expect("unable to write drone");
+        let mut neighbor_written = false;
+        for (id, _) in &self.packet_send {
+            write!(f, "\n\t- {}", id).expect("unable to write drone");
+            neighbor_written = true;
+        }
+        if !neighbor_written {
+            write!(f, "none").expect("unable to write drone");
+        }
+        write!(f, "\npdr: {}\n}}", self.pdr)
+    }
 }
 
 impl Drone for RustAndFurious {
@@ -85,23 +102,24 @@ impl RustAndFurious {
         }
     }
     fn process_packet(&mut self, packet: Packet) {
-        match packet.pack_type {
-            PacketType::MsgFragment(ref _fragment) => {
+        match packet.clone().pack_type {
+            PacketType::MsgFragment(ref fragment) => {
                 if !self.is_in_crash_behaviour {
-                    match self.perform_packet_checks(packet) {
-                        Ok((packet, sender)) => {
+                    match self.perform_packet_checks(packet.clone()) {
+                        Ok((mut packet, sender)) => {
                             if rng().random_bool(self.pdr as f64) {
-                                self.send_nack(packet.clone(), NackType::Dropped);
+                                packet.routing_header.decrease_hop_index();
+                                self.send_nack(packet.clone(), NackType::Dropped, fragment.fragment_index);
                                 self.controller_send.send(DroneEvent::PacketDropped(packet)).expect("controller_send channel closed but drone isn't crashed")
                             } else {
                                 self.forward_packet(packet, sender);
                             }
                         },
-                        Err((packet, nack_type)) => self.send_nack(packet, nack_type)
+                        Err((packet, nack_type)) => self.send_nack(packet, nack_type, fragment.fragment_index)
                     }
                 } else {
                     let nack_type = NackType::ErrorInRouting(packet.routing_header.hops[packet.routing_header.hop_index]);
-                    self.send_nack(packet, nack_type);
+                    self.send_nack(packet, nack_type, fragment.fragment_index);
                 }
             },
             PacketType::Nack(ref _nack) => {
@@ -141,6 +159,7 @@ impl RustAndFurious {
         // step 3
         if packet.routing_header.is_last_hop() {
             // step 3 error handling
+            packet.routing_header.decrease_hop_index();
             let nack_type = NackType::DestinationIsDrone;
             return Err((packet, nack_type));
         }
@@ -149,7 +168,8 @@ impl RustAndFurious {
         let sender_op = self.packet_send.get(&packet.routing_header.hops[packet.routing_header.hop_index]);
         if sender_op.is_none() {
             // step 4 error handling
-            let nack_type = NackType::ErrorInRouting(packet.routing_header.hops[packet.routing_header.hop_index-1]);
+            packet.routing_header.decrease_hop_index();
+            let nack_type = NackType::ErrorInRouting(packet.routing_header.hops[packet.routing_header.hop_index]);
             return Err((packet, nack_type));
         }
         let sender = sender_op.unwrap();
@@ -169,18 +189,17 @@ impl RustAndFurious {
         SourceRoutingHeader::with_first_hop(hops)
     }
     /// sends back a Nack after an error occurred
-    fn send_nack(&self, packet: Packet, nack_type: NackType) {
+    fn send_nack(&self, packet: Packet, nack_type: NackType, fragment_index: u64) {
         let sender_id = &packet.routing_header.hops[packet.routing_header.hop_index-1];
         let sender_op = self.packet_send.get(sender_id);
         if let Some(sender) = sender_op {
             let nack = Nack {
-                fragment_index: 0,
+                fragment_index,
                 nack_type
             };
             let routing_header = self.get_backwards_source_routing_header(packet.routing_header);
-            let session_id = rand::random::<u64>();
 
-            let nack_response = Packet::new_nack(routing_header, session_id, nack);
+            let nack_response = Packet::new_nack(routing_header, packet.session_id, nack);
             self.forward_packet(nack_response, sender);
         } else { // the drone which sent that packet to the drone just crashed
             self.controller_send.send(DroneEvent::ControllerShortcut(packet)).expect("controller_send channel closed but drone isn't crashed");
@@ -193,10 +212,10 @@ impl RustAndFurious {
             Ok(_) => self.controller_send.send(DroneEvent::PacketSent(packet)).expect("controller_send channel closed but drone isn't crashed"),
             Err(error) => {
                 let packet = error.0;
-                match packet.pack_type {
-                    PacketType::MsgFragment(ref _fragment) => {
+                match packet.clone().pack_type {
+                    PacketType::MsgFragment(ref fragment) => {
                         let nack_type = NackType::ErrorInRouting(packet.routing_header.hops[packet.routing_header.hop_index-1]);
-                        self.send_nack(packet, nack_type);
+                        self.send_nack(packet, nack_type, fragment.fragment_index);
                     },
                     PacketType::Nack(ref _nack) => self.controller_send.send(DroneEvent::ControllerShortcut(packet)).expect("controller_send channel closed but drone isn't crashed"),
                     PacketType::Ack(ref _ack) => self.controller_send.send(DroneEvent::ControllerShortcut(packet)).expect("controller_send channel closed but drone isn't crashed"),
@@ -252,31 +271,32 @@ mod drone_tests {
     use super::*;
     use std::collections::HashMap;
     use std::{fs, thread};
+    use std::thread::JoinHandle;
     use crossbeam_channel::{unbounded, Receiver, Sender};
     use wg_2024::config::Config;
     use wg_2024::controller::{DroneCommand, DroneEvent};
     use wg_2024::network::NodeId;
-    use wg_2024::tests as wg_tests;
+    use wg_2024::packet::{Ack, Fragment};
+    //use wg_2024::tests as wg_tests;
 
     const CONFIG_FILE_PATH: &str = "src/config.toml";
 
-    #[test]
-    fn wg_test1() {
-        wg_tests::generic_fragment_forward::<RustAndFurious>();
-    }
-    #[test]
-    fn wg_test2() {
-        wg_tests::generic_fragment_drop::<RustAndFurious>();
-    }
-    #[test]
-    fn wg_test3() {
-        wg_tests::generic_chain_fragment_drop::<RustAndFurious>();
-    }
-    #[test]
-    fn wg_test4() {
-        wg_tests::generic_chain_fragment_ack::<RustAndFurious>();
-    }
+    //#[test] fn wg_test1() { wg_tests::generic_fragment_forward::<RustAndFurious>(); }
+    //#[test] fn wg_test2() { wg_tests::generic_fragment_drop::<RustAndFurious>(); }
+    //#[test] fn wg_test3() { wg_tests::generic_chain_fragment_drop::<RustAndFurious>(); }
+    //#[test] fn wg_test4() { wg_tests::generic_chain_fragment_ack::<RustAndFurious>(); }
 
+    struct SimulationController {
+        drones: HashMap<NodeId, Sender<DroneCommand>>,
+        node_event_recv: Receiver<DroneEvent>,
+    }
+    impl SimulationController {
+        fn crash_all(&mut self) {
+            for (_, sender) in self.drones.iter() {
+                sender.send(DroneCommand::Crash).unwrap();
+            }
+        }
+    }
     fn get_test_drone() -> RustAndFurious {
         let id = rand::random::<u8>();
         let (controller_send, _) = unbounded();
@@ -290,10 +310,37 @@ mod drone_tests {
         let file_str = fs::read_to_string(file).expect("Unable to read config file");
         toml::from_str(&file_str).expect("Unable to parse TOML string data")
     }
+    /// create msg fragment packet
+    ///
+    /// routing header: 1 -> (11) -> 12 -> 21
+    ///
+    /// fragment: index 1 out of 1 - data (1; 128)
+    fn create_sample_packet() -> Packet {
+        Packet {
+            pack_type: PacketType::MsgFragment(Fragment {
+                fragment_index: 1,
+                total_n_fragments: 1,
+                length: 128,
+                data: [1; 128],
+            }),
+            routing_header: SourceRoutingHeader {
+                hop_index: 1,
+                hops: vec![1, 11, 12, 21],
+            },
+            session_id: 1,
+        }
+    }
+    fn crash_drones_and_wait_join(mut controller: SimulationController, mut handles: Vec<JoinHandle<()>>) {
+        controller.crash_all();
+        while let Some(handle) = handles.pop() {
+            handle.join().unwrap();
+        }
+    }
 
     #[test]
     fn test_get_backwards_source_routing_header() {
         let drone = get_test_drone();
+        *drone.id.lock().unwrap() = 42;
 
         let original_header = SourceRoutingHeader {
             hop_index: 2,
@@ -320,13 +367,11 @@ mod drone_tests {
     }
 
     #[test]
-    fn test_base() {
+    fn test_drones_crash() {
         let config = parse_config(CONFIG_FILE_PATH);
-        //println!("Configuration read");
 
         let mut controller_drones = HashMap::new();
         let (node_event_send, node_event_recv) = unbounded();
-        //println!("SC channels configured");
 
         let mut packet_channels = HashMap::new();
         for drone in config.drone.iter() {
@@ -338,7 +383,6 @@ mod drone_tests {
         for server in config.server.iter() {
             packet_channels.insert(server.id, unbounded());
         }
-        //println!("Configured packet channels");
 
         let mut handles = Vec::new();
         for drone in config.drone.into_iter() {
@@ -367,28 +411,278 @@ mod drone_tests {
                 drone.run();
             }));
         }
-        //println!("All drones have been configured");
 
-        let mut controller = SimulationController {
+        let controller = SimulationController {
             drones: controller_drones,
             node_event_recv,
         };
-        controller.crash_all();
-        //println!("Sent command to crash drones");
 
-        while let Some(handle) = handles.pop() {
-            handle.join().unwrap();
-        }
+        crash_drones_and_wait_join(controller, handles);
     }
-    struct SimulationController {
-        drones: HashMap<NodeId, Sender<DroneCommand>>,
-        node_event_recv: Receiver<DroneEvent>,
+
+    #[test]
+    pub fn generic_fragment_forward() {
+        let mut controller_drones = HashMap::new();
+        let (node_event_send, node_event_recv) = unbounded();
+        let mut handles = Vec::new();
+
+        // drone 2 <Packet>
+        let (d_send, d_recv) = unbounded();
+        // drone 3 <Packet>
+        let (d2_send, d2_recv) = unbounded::<Packet>();
+        // SC commands
+        let (d_command_send, d_command_recv) = unbounded();
+
+        let neighbours = HashMap::from([(12, d2_send.clone())]);
+        controller_drones.insert(11, d_command_send);
+        let mut drone = RustAndFurious::new(
+            11,
+            node_event_send.clone(),
+            d_command_recv,
+            d_recv.clone(),
+            neighbours,
+            0.0,
+        );
+        // Spawn the drone's run method in a separate thread
+        handles.push(thread::spawn(move || {
+            drone.run();
+        }));
+
+        let mut msg = create_sample_packet();
+
+        // "Client" sends packet to d
+        d_send.send(msg.clone()).unwrap();
+        msg.routing_header.hop_index = 2;
+
+        // d2 receives packet from d1
+        assert_eq!(d2_recv.recv().unwrap(), msg);
+
+        let controller = SimulationController {
+            drones: controller_drones,
+            node_event_recv,
+        };
+        crash_drones_and_wait_join(controller, handles);
     }
-    impl SimulationController {
-        fn crash_all(&mut self) {
-            for (_, sender) in self.drones.iter() {
-                sender.send(DroneCommand::Crash).unwrap();
+
+    #[test]
+    pub fn generic_fragment_drop() {
+        let mut controller_drones = HashMap::new();
+        let (node_event_send, node_event_recv) = unbounded();
+        let mut handles = Vec::new();
+
+        // Client 1
+        let (c_send, c_recv) = unbounded();
+        // Drone 11
+        let (d_send11, d_recv11) = unbounded();
+        // Drone 12
+        let (d_send12, _d_recv12) = unbounded();
+        // SC commands
+        let (d_command_send, d_command_recv) = unbounded();
+
+        controller_drones.insert(11, d_command_send);
+        let neighbours = HashMap::from([(12, d_send12.clone()), (1, c_send.clone())]);
+        let mut drone = RustAndFurious::new(
+            11,
+            node_event_send.clone(),
+            d_command_recv,
+            d_recv11,
+            neighbours,
+            1.0,
+        );
+
+        // Spawn the drone's run method in a separate thread
+        handles.push(thread::spawn(move || {
+            drone.run();
+        }));
+
+        let msg = create_sample_packet();
+
+        // "Client" sends packet to the drone
+        d_send11.send(msg.clone()).unwrap();
+
+        let dropped = Nack {
+            fragment_index: 1,
+            nack_type: NackType::Dropped,
+        };
+        let srh = SourceRoutingHeader {
+            hop_index: 1,
+            hops: vec![11, 1],
+        };
+        let nack_packet = Packet {
+            pack_type: PacketType::Nack(dropped),
+            routing_header: srh,
+            session_id: 1,
+        };
+
+        // Client listens for packet from the drone (Dropped Nack)
+        assert_eq!(c_recv.recv().unwrap(), nack_packet);
+
+        let controller = SimulationController {
+            drones: controller_drones,
+            node_event_recv,
+        };
+        crash_drones_and_wait_join(controller, handles);
+    }
+
+    #[test]
+    pub fn generic_chain_fragment_drop() {
+        let mut controller_drones = HashMap::new();
+        let (node_event_send, node_event_recv) = unbounded();
+        let mut handles = Vec::new();
+
+        // Client 1 channels
+        let (c_send, c_recv) = unbounded();
+        // Server 21 channels
+        let (s_send, _s_recv) = unbounded();
+        // Drone 11
+        let (d_send, d_recv) = unbounded();
+        // Drone 12
+        let (d12_send, d12_recv) = unbounded();
+        // SC - needed to not make the drone crash
+        let (controller_drone_send11, controller_drone_recv11) = unbounded();
+        let (controller_drone_send12, controller_drone_recv12) = unbounded();
+
+        // Drone 11
+        controller_drones.insert(11, controller_drone_send11);
+        let neighbours11 = HashMap::from([(12, d12_send.clone()), (1, c_send.clone())]);
+        let mut drone1 = RustAndFurious::new(
+            11,
+            node_event_send.clone(),
+            controller_drone_recv11,
+            d_recv.clone(),
+            neighbours11,
+            0.0,
+        );
+        // Drone 12
+        controller_drones.insert(12, controller_drone_send12);
+        let neighbours12 = HashMap::from([(11, d_send.clone()), (21, s_send.clone())]);
+        let mut drone2 = RustAndFurious::new(
+            12,
+            node_event_send.clone(),
+            controller_drone_recv12,
+            d12_recv.clone(),
+            neighbours12,
+            1.0,
+        );
+
+        // Spawn the drone's run method in a separate thread
+        handles.push(thread::spawn(move || {
+            drone1.run();
+        }));
+
+        handles.push(thread::spawn(move || {
+            drone2.run();
+        }));
+
+        let msg = create_sample_packet();
+
+        // "Client" sends packet to the drone
+        d_send.send(msg.clone()).unwrap();
+
+        println!("ready to recv");
+        // Client receive an NACK originated from 'd2'
+        assert_eq!(
+            c_recv.recv().unwrap(),
+            Packet {
+                pack_type: PacketType::Nack(Nack {
+                    fragment_index: 1,
+                    nack_type: NackType::Dropped,
+                }),
+                routing_header: SourceRoutingHeader {
+                    hop_index: 2,
+                    hops: vec![12, 11, 1],
+                },
+                session_id: 1,
             }
-        }
+        );
+
+        let controller = SimulationController {
+            drones: controller_drones,
+            node_event_recv,
+        };
+        crash_drones_and_wait_join(controller, handles);
+    }
+
+    #[test]
+    pub fn generic_chain_fragment_ack() {
+        let mut controller_drones = HashMap::new();
+        let (node_event_send, node_event_recv) = unbounded();
+        let mut handles = Vec::new();
+
+        // Client<1> channels
+        let (c_send, c_recv) = unbounded();
+        // Server<21> channels
+        let (s_send, s_recv) = unbounded();
+        // Drone 11
+        let (d_send, d_recv) = unbounded();
+        // Drone 12
+        let (d12_send, d12_recv) = unbounded();
+
+        // Drone 11
+        let (controller_drone_send11, controller_drone_recv11) = unbounded();
+        controller_drones.insert(11, controller_drone_send11);
+        let neighbours11 = HashMap::from([(12, d12_send.clone()), (1, c_send.clone())]);
+        let mut drone = RustAndFurious::new(
+            11,
+            node_event_send.clone(),
+            controller_drone_recv11,
+            d_recv.clone(),
+            neighbours11,
+            0.0,
+        );
+        // Drone 12
+        let (controller_drone_send12, controller_drone_recv12) = unbounded();
+        controller_drones.insert(12, controller_drone_send12);
+        let neighbours12 = HashMap::from([(11, d_send.clone()), (21, s_send.clone())]);
+        let mut drone2 = RustAndFurious::new(
+            12,
+            node_event_send.clone(),
+            controller_drone_recv12,
+            d12_recv.clone(),
+            neighbours12,
+            0.0,
+        );
+
+        // Spawn the drone's run method in a separate thread
+        handles.push(thread::spawn(move || {
+            drone.run();
+        }));
+
+        handles.push(thread::spawn(move || {
+            drone2.run();
+        }));
+
+        let mut msg = create_sample_packet();
+
+        // "Client" sends packet to the drone
+        d_send.send(msg.clone()).unwrap();
+
+        // "Server" receives the packet that has been sent
+        msg.routing_header.hop_index = 3;
+        // Server receives the fragment
+        println!("ready to recv");
+        assert_eq!(s_recv.recv().unwrap(), msg);
+
+        // "Server" sends ack to "Client"
+        let mut ack = Packet {
+            pack_type: PacketType::Ack(Ack { fragment_index: 1 }),
+            routing_header: SourceRoutingHeader {
+                hop_index: 1,
+                hops: vec![21, 12, 11, 1],
+            },
+            session_id: 1,
+        };
+        d12_send.send(ack.clone()).unwrap();
+
+        ack.routing_header.hop_index = 3;
+
+        // "Client" receive an ACK originated from "Server"
+        assert_eq!(c_recv.recv().unwrap(), ack);
+
+        let controller = SimulationController {
+            drones: controller_drones,
+            node_event_recv,
+        };
+        crash_drones_and_wait_join(controller, handles);
     }
 }
