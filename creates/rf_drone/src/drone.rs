@@ -879,15 +879,28 @@ mod drone_tests {
 
         // client receives two flood response with the paths to se two servers
         let client_recv = packet_channels[&11].1.clone();
+        let path_trace = Vec::from([(1, NodeType::Drone), (3, NodeType::Drone), (22, NodeType::Server)]);
         assert!(match client_recv.recv().unwrap().pack_type {
-            PacketType::FloodResponse(_) => true,
+            PacketType::FloodResponse(flood_response) => compare_path_trace(&flood_response.path_trace, &path_trace),
             _ => false
         });
+        let path_trace = Vec::from([(1, NodeType::Drone), (3, NodeType::Drone), (4, NodeType::Drone), (21, NodeType::Server)]);
         assert!(match client_recv.recv().unwrap().pack_type {
-            PacketType::FloodResponse(_) => true,
+            PacketType::FloodResponse(flood_response) => compare_path_trace(&flood_response.path_trace, &path_trace),
             _ => false
         });
 
         crash_drones_and_wait_join(controller, handles);
+    }
+    fn compare_path_trace(vec1: &Vec<(NodeId, NodeType)>, vec2: &Vec<(NodeId, NodeType)>) -> bool {
+        if vec1.len() != vec2.len() {
+            return false;
+        }
+        for (item1, item2) in vec1.iter().zip(vec2.iter()) {
+            if item1 != item2 {
+                return false;
+            }
+        }
+        true
     }
 }
