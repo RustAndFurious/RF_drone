@@ -153,16 +153,15 @@ impl RustAndFurious {
             return Err((packet, nack_type));
         }
 
-        // step 2
-        packet.routing_header.increase_hop_index();
-
         // step 3
         if packet.routing_header.is_last_hop() {
             // step 3 error handling
-            packet.routing_header.decrease_hop_index();
             let nack_type = NackType::DestinationIsDrone;
             return Err((packet, nack_type));
         }
+
+        // step 2
+        packet.routing_header.increase_hop_index();
 
         // step 4
         let sender_op = self.packet_send.get(&packet.routing_header.hops[packet.routing_header.hop_index]);
@@ -579,7 +578,6 @@ mod drone_tests {
         // "Client" sends packet to the drone
         d_send.send(msg.clone()).unwrap();
 
-        println!("ready to recv");
         // Client receive an NACK originated from 'd2'
         assert_eq!(
             c_recv.recv().unwrap(),
@@ -660,7 +658,6 @@ mod drone_tests {
         // "Server" receives the packet that has been sent
         msg.routing_header.hop_index = 3;
         // Server receives the fragment
-        println!("ready to recv");
         assert_eq!(s_recv.recv().unwrap(), msg);
 
         // "Server" sends ack to "Client"
