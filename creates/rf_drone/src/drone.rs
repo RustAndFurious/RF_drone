@@ -109,8 +109,8 @@ impl RustAndFurious {
                         Ok((mut packet, sender)) => {
                             if rng().random_bool(self.pdr as f64) {
                                 packet.routing_header.decrease_hop_index();
-                                self.send_nack(packet.clone(), NackType::Dropped, fragment.fragment_index);
-                                self.controller_send.send(DroneEvent::PacketDropped(packet)).expect("controller_send channel closed but drone isn't crashed")
+                                self.controller_send.send(DroneEvent::PacketDropped(packet.clone())).expect("controller_send channel closed but drone isn't crashed");
+                                self.send_nack(packet, NackType::Dropped, fragment.fragment_index);
                             } else {
                                 self.forward_packet(packet, sender);
                             }
@@ -188,7 +188,7 @@ impl RustAndFurious {
         SourceRoutingHeader::with_first_hop(hops)
     }
     /// sends back a Nack after an error occurred
-    fn send_nack(&self, packet: Packet, nack_type: NackType, fragment_index: u64) {
+    fn send_nack(&self, mut packet: Packet, nack_type: NackType, fragment_index: u64) {
         let sender_id = &packet.routing_header.hops[packet.routing_header.hop_index-1];
         let sender_op = self.packet_send.get(sender_id);
         if let Some(sender) = sender_op {
@@ -196,6 +196,9 @@ impl RustAndFurious {
                 fragment_index,
                 nack_type
             };
+            while packet.routing_header.hops.len() > packet.routing_header.hop_index {
+                packet.routing_header.hops.pop();
+            }
             let routing_header = self.get_backwards_source_routing_header(packet.routing_header);
 
             let nack_response = Packet::new_nack(routing_header, packet.session_id, nack);
@@ -337,7 +340,7 @@ mod drone_tests {
     }
 
     #[test]
-    fn test_get_backwards_source_routing_header() {
+    fn get_backwards_source_routing_header() {
         let drone = get_test_drone();
         *drone.id.lock().unwrap() = 42;
 
@@ -353,7 +356,7 @@ mod drone_tests {
     }
 
     #[test]
-    fn test_drop_rate() {
+    fn drop_rate() {
         let drone = get_test_drone();
 
         let mut count = 0;
@@ -366,7 +369,7 @@ mod drone_tests {
     }
 
     #[test]
-    fn test_drones_crash() {
+    fn drones_crash() {
         let config = parse_config(CONFIG_FILE_PATH);
 
         let mut controller_drones = HashMap::new();
@@ -420,7 +423,7 @@ mod drone_tests {
     }
 
     #[test]
-    pub fn generic_fragment_forward() {
+    fn fragment_forward() {
         let mut controller_drones = HashMap::new();
         let (node_event_send, node_event_recv) = unbounded();
         let mut handles = Vec::new();
@@ -456,6 +459,10 @@ mod drone_tests {
         // d2 receives packet from d1
         assert_eq!(d2_recv.recv().unwrap(), msg);
 
+        // controller receives packet forward event from d1
+        let event = DroneEvent::PacketSent(msg.clone());
+        assert_eq!(node_event_recv.recv().unwrap(), event);
+
         let controller = SimulationController {
             drones: controller_drones,
             node_event_recv,
@@ -464,7 +471,7 @@ mod drone_tests {
     }
 
     #[test]
-    pub fn generic_fragment_drop() {
+    fn fragment_drop() {
         let mut controller_drones = HashMap::new();
         let (node_event_send, node_event_recv) = unbounded();
         let mut handles = Vec::new();
@@ -516,6 +523,9 @@ mod drone_tests {
         // Client listens for packet from the drone (Dropped Nack)
         assert_eq!(c_recv.recv().unwrap(), nack_packet);
 
+        // controller receives the PacketSent event about the nack packet
+        assert_eq!(node_event_recv.recv().unwrap(), DroneEvent::PacketSent(nack_packet));
+
         let controller = SimulationController {
             drones: controller_drones,
             node_event_recv,
@@ -524,7 +534,7 @@ mod drone_tests {
     }
 
     #[test]
-    pub fn generic_chain_fragment_drop() {
+    fn chain_fragment_drop() {
         let mut controller_drones = HashMap::new();
         let (node_event_send, node_event_recv) = unbounded();
         let mut handles = Vec::new();
@@ -568,31 +578,41 @@ mod drone_tests {
         handles.push(thread::spawn(move || {
             drone1.run();
         }));
-
         handles.push(thread::spawn(move || {
             drone2.run();
         }));
 
-        let msg = create_sample_packet();
+        let mut msg = create_sample_packet();
 
         // "Client" sends packet to the drone
         d_send.send(msg.clone()).unwrap();
 
         // Client receive an NACK originated from 'd2'
-        assert_eq!(
-            c_recv.recv().unwrap(),
-            Packet {
-                pack_type: PacketType::Nack(Nack {
-                    fragment_index: 1,
-                    nack_type: NackType::Dropped,
-                }),
-                routing_header: SourceRoutingHeader {
-                    hop_index: 2,
-                    hops: vec![12, 11, 1],
-                },
-                session_id: 1,
-            }
-        );
+        let mut nack_packet = Packet {
+            pack_type: PacketType::Nack(Nack {
+                fragment_index: 1,
+                nack_type: NackType::Dropped,
+            }),
+            routing_header: SourceRoutingHeader {
+                hop_index: 2,
+                hops: vec![12, 11, 1],
+            },
+            session_id: 1,
+        };
+        assert_eq!(c_recv.recv().unwrap(), nack_packet);
+
+        // controller receives PacketSent event from d1
+        msg.routing_header.increase_hop_index();
+        assert_eq!(node_event_recv.recv().unwrap(), DroneEvent::PacketSent(msg.clone()));
+        // controller receives PacketDropped event from d2
+        nack_packet.routing_header.hop_index = 1;
+        assert_eq!(node_event_recv.recv().unwrap(), DroneEvent::PacketDropped(msg));
+        // controller receives PacketSent event from d2 about the nack packet
+        nack_packet.routing_header.hop_index = 1;
+        assert_eq!(node_event_recv.recv().unwrap(), DroneEvent::PacketSent(nack_packet.clone()));
+        // controller receives PacketSent event from d1 about the nack packet
+        nack_packet.routing_header.hop_index = 2;
+        assert_eq!(node_event_recv.recv().unwrap(), DroneEvent::PacketSent(nack_packet));
 
         let controller = SimulationController {
             drones: controller_drones,
@@ -602,7 +622,7 @@ mod drone_tests {
     }
 
     #[test]
-    pub fn generic_chain_fragment_ack() {
+    fn chain_fragment_ack() {
         let mut controller_drones = HashMap::new();
         let (node_event_send, node_event_recv) = unbounded();
         let mut handles = Vec::new();
@@ -655,8 +675,13 @@ mod drone_tests {
         // "Client" sends packet to the drone
         d_send.send(msg.clone()).unwrap();
 
-        // "Server" receives the packet that has been sent
-        msg.routing_header.hop_index = 3;
+        // controller receives PacketSent event from d1
+        msg.routing_header.increase_hop_index();
+        assert_eq!(node_event_recv.recv().unwrap(), DroneEvent::PacketSent(msg.clone()));
+        // controller receives PacketSent event from d2
+        msg.routing_header.increase_hop_index();
+        assert_eq!(node_event_recv.recv().unwrap(), DroneEvent::PacketSent(msg.clone()));
+
         // Server receives the fragment
         assert_eq!(s_recv.recv().unwrap(), msg);
 
@@ -671,7 +696,12 @@ mod drone_tests {
         };
         d12_send.send(ack.clone()).unwrap();
 
-        ack.routing_header.hop_index = 3;
+        // controller receives PacketSent event from d1
+        ack.routing_header.increase_hop_index();
+        assert_eq!(node_event_recv.recv().unwrap(), DroneEvent::PacketSent(ack.clone()));
+        // controller receives PacketSent event from d2
+        ack.routing_header.increase_hop_index();
+        assert_eq!(node_event_recv.recv().unwrap(), DroneEvent::PacketSent(ack.clone()));
 
         // "Client" receive an ACK originated from "Server"
         assert_eq!(c_recv.recv().unwrap(), ack);
@@ -682,4 +712,25 @@ mod drone_tests {
         };
         crash_drones_and_wait_join(controller, handles);
     }
+
+
+    /*fn forward_important_packet_trough_controller() {
+
+    }
+
+
+    fn flood() {
+        let mut controller_drones = HashMap::new();
+        let (node_event_send, node_event_recv) = unbounded();
+        let mut handles = Vec::new();
+
+
+
+
+        let controller = SimulationController {
+            drones: controller_drones,
+            node_event_recv,
+        };
+        crash_drones_and_wait_join(controller, handles);
+    }*/
 }
