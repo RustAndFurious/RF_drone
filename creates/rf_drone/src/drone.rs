@@ -239,7 +239,7 @@ impl RustAndFurious {
         }
         let sender = sender_op.unwrap();
 
-        self.forward_packet(packet.clone(), sender);
+        self.forward_packet(packet, sender);
     }
     fn handle_flood_request(&mut self, mut flood_request: FloodRequest, session_id: u64) {
         if self.received_flood_ids.contains(&(*self.id.clone().lock().unwrap(), flood_request.flood_id)) { // flood already passed through this drone
@@ -845,11 +845,13 @@ mod drone_tests {
         let drone_send = packet_channels[&4].0.clone();
         handles.push(thread::spawn(move || {
             let recv = server_recv.recv().unwrap();
+            //println!("server 21 received something");
             assert!( match recv.clone().pack_type {
                 PacketType::FloodRequest(mut flood_request) => {
                     flood_request.increment(21, NodeType::Server);
                     let mut packet = flood_request.generate_response(recv.session_id);
                     packet.routing_header.increase_hop_index();
+                    //println!("server 21 sending: {}", packet.clone());
                     drone_send.send(packet).unwrap();
                     true
                 },
@@ -860,11 +862,13 @@ mod drone_tests {
         let drone_send = packet_channels[&3].0.clone();
         handles.push(thread::spawn(move || {
             let recv = server_recv.recv().unwrap();
+            //println!("server 22 received something");
             assert!( match recv.clone().pack_type {
                 PacketType::FloodRequest(mut flood_request) => {
                     flood_request.increment(22, NodeType::Server);
                     let mut packet = flood_request.generate_response(recv.session_id);
                     packet.routing_header.increase_hop_index();
+                    //println!("server 22 sending: {}", packet.clone());
                     drone_send.send(packet).unwrap();
                     true
                 },
@@ -878,29 +882,55 @@ mod drone_tests {
         drone_send.send(flood_request).unwrap();
 
         // client receives two flood response with the paths to se two servers
+        let mut path_traces = Vec::new();
         let client_recv = packet_channels[&11].1.clone();
-        let path_trace = Vec::from([(1, NodeType::Drone), (3, NodeType::Drone), (22, NodeType::Server)]);
         assert!(match client_recv.recv().unwrap().pack_type {
-            PacketType::FloodResponse(flood_response) => compare_path_trace(&flood_response.path_trace, &path_trace),
+            PacketType::FloodResponse(flood_response) => { println!("{:?}", &flood_response.path_trace); path_traces.push(flood_response.path_trace); true },
             _ => false
         });
-        let path_trace = Vec::from([(1, NodeType::Drone), (3, NodeType::Drone), (4, NodeType::Drone), (21, NodeType::Server)]);
         assert!(match client_recv.recv().unwrap().pack_type {
-            PacketType::FloodResponse(flood_response) => compare_path_trace(&flood_response.path_trace, &path_trace),
+            PacketType::FloodResponse(flood_response) => { println!("{:?}", &flood_response.path_trace); path_traces.push(flood_response.path_trace); true },
             _ => false
         });
+        assert!(match client_recv.recv().unwrap().pack_type {
+            PacketType::FloodResponse(flood_response) => { println!("{:?}", &flood_response.path_trace); path_traces.push(flood_response.path_trace); true },
+            _ => false
+        });
+        assert!(match client_recv.recv().unwrap().pack_type {
+            PacketType::FloodResponse(flood_response) => { println!("{:?}", &flood_response.path_trace); path_traces.push(flood_response.path_trace); true },
+            _ => false
+        });
+        let mut topology:HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
+        topology.insert(11, HashSet::from([1]));
+        topology.insert(1, HashSet::from([11, 2, 3]));
+        topology.insert(2, HashSet::from([1, 4]));
+        topology.insert(3, HashSet::from([1, 22, 4]));
+        topology.insert(4, HashSet::from([2, 21, 3]));
+        topology.insert(21, HashSet::from([4]));
+        topology.insert(22, HashSet::from([3]));
+        assert_eq!(topology, build_topology(11, path_traces));
+
 
         crash_drones_and_wait_join(controller, handles);
     }
-    fn compare_path_trace(vec1: &Vec<(NodeId, NodeType)>, vec2: &Vec<(NodeId, NodeType)>) -> bool {
-        if vec1.len() != vec2.len() {
-            return false;
-        }
-        for (item1, item2) in vec1.iter().zip(vec2.iter()) {
-            if item1 != item2 {
-                return false;
+    fn build_topology(self_id: NodeId, path_traces: Vec<Vec<(NodeId, NodeType)>>) -> HashMap<NodeId, HashSet<NodeId>> {
+        let mut topology = HashMap::new();
+
+        for path_trace in path_traces {
+            let mut last = self_id;
+            if topology.get(&last).is_none() {
+                topology.insert(last, HashSet::new());
+            }
+            for (node_id, _) in path_trace {
+                topology.get_mut(&last).unwrap().insert(node_id);
+                if topology.get(&node_id).is_none() {
+                    topology.insert(node_id, HashSet::new());
+                }
+                topology.get_mut(&node_id).unwrap().insert(last);
+                last = node_id;
             }
         }
-        true
+
+        topology
     }
 }
