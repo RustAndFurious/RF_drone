@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
-members = ["creates/rf_drone"]
+members = ["crates/rf_drone"]
 
 [dependencies]
-rf_drone = { path = "creates/rf_drone" }
+rf_drone = { path = "crates/rf_drone" }
