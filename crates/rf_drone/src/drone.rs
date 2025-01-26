@@ -1,7 +1,6 @@
 use crossbeam_channel::{select_biased, Receiver, Sender};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
-use std::sync::{Arc, Mutex};
 use rand::{rng, Rng};
 
 use wg_2024::controller::{DroneCommand, DroneEvent};
@@ -12,7 +11,7 @@ use wg_2024::packet::{FloodRequest, Nack, NackType, NodeType, Packet, PacketType
 /// drone implementation of the Rust&Furious group
 pub struct RustAndFurious {
     // common data
-    id: Arc<Mutex<NodeId>>,
+    id: u8,
     controller_send: Sender<DroneEvent>,
     controller_recv: Receiver<DroneCommand>,
     packet_recv: Receiver<Packet>,
@@ -27,7 +26,7 @@ pub struct RustAndFurious {
 impl Debug for RustAndFurious {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let _ = f.debug_struct("RustAndFurious");
-        write!(f, " {{\nid: {}\nneighbor ids:", self.id.lock().unwrap()).expect("unable to write drone");
+        write!(f, " {{\nid: {}\nneighbor ids:", self.id).expect("unable to write drone");
         let mut neighbor_written = false;
         for (id, _) in &self.packet_send {
             write!(f, "\n\t- {}", id).expect("unable to write drone");
@@ -50,7 +49,7 @@ impl Drone for RustAndFurious {
         pdr: f32
     ) -> Self {
         RustAndFurious {
-            id: Arc::new(Mutex::new(id)),
+            id,
             controller_send,
             controller_recv,
             packet_recv,
@@ -69,14 +68,14 @@ impl Drone for RustAndFurious {
                         if let Ok(command) = command {
                             self.handle_command(command);
                         } else { // this shouldn't happen
-                            panic!("controller_recv channel closed but drone isn't crashed");
+                            panic!("{}: controller_recv channel closed but drone isn't crashed", self.id);
                         }
                     },
                     recv(self.packet_recv) -> packet => {
                         if let Ok(packet) = packet {
                             self.process_packet(packet);
-                        } else { // this shouldn't happen
-                            panic!("packet_recv channel closed but drone isn't crashed");
+                        } else {
+                            // this can happen only before the drone crash
                         }
                     }
                 }
@@ -147,9 +146,9 @@ impl RustAndFurious {
     /// performs all the checks on the packet, as described by the protocol
     fn perform_packet_checks(&self, mut packet: Packet) -> Result<(Packet, &Sender<Packet>), (Packet, NackType)> {
         // step 1
-        if packet.routing_header.hops[packet.routing_header.hop_index] != *self.id.clone().lock().unwrap() {
+        if packet.routing_header.hops[packet.routing_header.hop_index] != self.id {
             // step 1 error handling
-            let nack_type = NackType::UnexpectedRecipient(*self.id.clone().lock().unwrap());
+            let nack_type = NackType::UnexpectedRecipient(self.id);
             return Err((packet, nack_type));
         }
 
@@ -180,7 +179,7 @@ impl RustAndFurious {
     fn get_backwards_source_routing_header(&self, original: SourceRoutingHeader) -> SourceRoutingHeader {
         let tmp = original.hops.split_at(original.hop_index).0;
         let mut hops = Vec::new();
-        hops.push(*self.id.clone().lock().unwrap());
+        hops.push(self.id);
         for id in tmp.iter().rev() {
             hops.push(*id);
         }
@@ -242,17 +241,17 @@ impl RustAndFurious {
         self.forward_packet(packet, sender);
     }
     fn handle_flood_request(&mut self, mut flood_request: FloodRequest, session_id: u64) {
-        if self.received_flood_ids.contains(&(*self.id.clone().lock().unwrap(), flood_request.flood_id)) { // flood already passed through this drone
-            flood_request.increment(*self.id.clone().lock().unwrap(), NodeType::Drone);
+        if self.received_flood_ids.contains(&(self.id, flood_request.flood_id)) { // flood already passed through this drone
+            flood_request.increment(self.id, NodeType::Drone);
             self.generate_and_send_flood_response(flood_request, session_id);
         } else { // flood not yet passed through this drone
-            self.received_flood_ids.insert((*self.id.clone().lock().unwrap(), flood_request.flood_id));
+            self.received_flood_ids.insert((self.id, flood_request.flood_id));
             let last_flood_node = match flood_request.path_trace.last() {
                 Some((node_id, _)) => node_id,
                 None => &flood_request.initiator_id
             };
             let mut flood_request = flood_request.clone();
-            flood_request.increment(*self.id.clone().lock().unwrap(), NodeType::Drone);
+            flood_request.increment(self.id, NodeType::Drone);
             let mut flood_request_forwarded = false;
 
             // forward the flood request to other neighbors
@@ -337,8 +336,8 @@ mod drone_tests {
 
     #[test]
     fn get_backwards_source_routing_header() {
-        let drone = get_test_drone();
-        *drone.id.lock().unwrap() = 42;
+        let mut drone = get_test_drone();
+        drone.id = 42;
 
         let original_header = SourceRoutingHeader {
             hop_index: 2,
