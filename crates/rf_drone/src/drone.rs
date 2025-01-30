@@ -241,11 +241,7 @@ impl RustAndFurious {
         self.forward_packet(packet, sender);
     }
     fn handle_flood_request(&mut self, mut flood_request: FloodRequest, session_id: u64) {
-        if self.received_flood_ids.contains(&(self.id, flood_request.flood_id)) { // flood already passed through this drone
-            flood_request.increment(self.id, NodeType::Drone);
-            self.generate_and_send_flood_response(flood_request, session_id);
-        } else { // flood not yet passed through this drone
-            self.received_flood_ids.insert((self.id, flood_request.flood_id));
+        if self.received_flood_ids.insert((flood_request.initiator_id, flood_request.flood_id)) { // flood not yet passed through this drone
             let last_flood_node = match flood_request.path_trace.last() {
                 Some((node_id, _)) => node_id,
                 None => &flood_request.initiator_id
@@ -267,6 +263,9 @@ impl RustAndFurious {
             if !flood_request_forwarded {
                 self.generate_and_send_flood_response(flood_request, session_id);
             }
+        } else { // flood already passed through this drone
+            flood_request.increment(self.id, NodeType::Drone);
+            self.generate_and_send_flood_response(flood_request, session_id);
         }
     }
 }
