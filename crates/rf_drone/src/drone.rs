@@ -192,7 +192,6 @@ impl RustAndFurious {
             .get(&packet.routing_header.hops[packet.routing_header.hop_index]);
         if sender_op.is_none() {
             // step 4 error handling
-            packet.routing_header.decrease_hop_index();
             let nack_type = NackType::ErrorInRouting(
                 packet.routing_header.hops[packet.routing_header.hop_index],
             );
