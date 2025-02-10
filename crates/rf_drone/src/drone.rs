@@ -2,7 +2,6 @@ use crossbeam_channel::{select_biased, Receiver, Sender};
 use rand::{rng, Rng};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
-
 use wg_2024::controller::{DroneCommand, DroneEvent};
 use wg_2024::drone::Drone;
 use wg_2024::network::{NodeId, SourceRoutingHeader};
@@ -62,30 +61,30 @@ impl Drone for RustAndFurious {
 
     fn run(&mut self) {
         loop {
-            if !self.is_in_crash_behaviour {
-                select_biased! {
-                    recv(self.controller_recv) -> command => {
-                        if let Ok(command) = command {
-                            self.handle_command(command);
-                        } else { // this shouldn't happen
-                            panic!("{}: controller_recv channel closed but drone isn't crashed", self.id);
-                        }
-                    },
-                    recv(self.packet_recv) -> packet => {
-                        if let Ok(packet) = packet {
-                            self.process_packet(packet);
-                        } else {
-                            // this can happen only before the drone crash
-                        }
+            select_biased! {
+                recv(self.controller_recv) -> command => {
+                    if let Ok(command) = command {
+                        self.handle_command(command);
+                    } else { // this shouldn't happen
+                        panic!("{}: controller_recv channel closed but drone isn't crashed", self.id);
                     }
-                }
-            } else {
-                match self.packet_recv.try_recv() {
-                    Ok(packet) => {
+                },
+                recv(self.packet_recv) -> packet => {
+                    if let Ok(packet) = packet {
                         self.process_packet(packet);
                     }
-                    Err(_) => break,
                 }
+            }
+            if self.is_in_crash_behaviour {
+                break;
+            }
+        }
+        loop {
+            match self.packet_recv.recv() {
+                Ok(packet) => {
+                    self.process_packet(packet);
+                }
+                Err(_) => break,
             }
         }
     }
@@ -398,8 +397,23 @@ mod drone_tests {
     }
     fn crash_drones_and_wait_join(
         mut controller: SimulationController,
+        drone_senders: Vec<Sender<Packet>>,
+        config: Config,
         mut handles: Vec<JoinHandle<()>>,
     ) {
+        for drone_sender in drone_senders {
+            drop(drone_sender);
+        }
+        for drone in config.drone {
+            for id in drone.connected_node_ids {
+                controller
+                    .drones
+                    .get(&drone.id)
+                    .unwrap()
+                    .send(DroneCommand::RemoveSender(id))
+                    .unwrap()
+            }
+        }
         controller.crash_all();
         while let Some(handle) = handles.pop() {
             handle.join().unwrap();
@@ -454,7 +468,7 @@ mod drone_tests {
         }
 
         let mut handles = Vec::new();
-        for drone in config.drone.into_iter() {
+        for drone in config.drone.clone().into_iter() {
             // controller
             let (controller_drone_send, controller_drone_recv) = unbounded();
             controller_drones.insert(drone.id, controller_drone_send);
@@ -486,7 +500,8 @@ mod drone_tests {
             _node_event_recv: node_event_recv,
         };
 
-        crash_drones_and_wait_join(controller, handles);
+        drop(packet_channels);
+        crash_drones_and_wait_join(controller, Vec::new(), config, handles);
     }
 
     #[test]
@@ -534,7 +549,22 @@ mod drone_tests {
             drones: controller_drones,
             _node_event_recv: node_event_recv,
         };
-        crash_drones_and_wait_join(controller, handles);
+
+        let senders = vec![d_send, d2_send];
+        crash_drones_and_wait_join(
+            controller,
+            senders,
+            Config {
+                drone: vec![wg_2024::config::Drone {
+                    id: 11,
+                    connected_node_ids: vec![12],
+                    pdr: 0.0,
+                }],
+                client: vec![],
+                server: vec![],
+            },
+            handles,
+        );
     }
 
     #[test]
@@ -605,7 +635,21 @@ mod drone_tests {
             drones: controller_drones,
             _node_event_recv: node_event_recv,
         };
-        crash_drones_and_wait_join(controller, handles);
+        let drone_senders = Vec::from([d_send11, d_send12]);
+        crash_drones_and_wait_join(
+            controller,
+            drone_senders,
+            Config {
+                drone: vec![wg_2024::config::Drone {
+                    id: 11,
+                    connected_node_ids: vec![1, 12],
+                    pdr: 0.0,
+                }],
+                client: vec![],
+                server: vec![],
+            },
+            handles,
+        );
     }
 
     #[test]
@@ -705,7 +749,29 @@ mod drone_tests {
             drones: controller_drones,
             _node_event_recv: node_event_recv,
         };
-        crash_drones_and_wait_join(controller, handles);
+
+        let senders = vec![d_send, d12_send];
+        crash_drones_and_wait_join(
+            controller,
+            senders,
+            Config {
+                drone: vec![
+                    wg_2024::config::Drone {
+                        id: 11,
+                        connected_node_ids: vec![12, 1],
+                        pdr: 0.0,
+                    },
+                    wg_2024::config::Drone {
+                        id: 12,
+                        connected_node_ids: vec![11, 21],
+                        pdr: 0.0,
+                    },
+                ],
+                client: vec![],
+                server: vec![],
+            },
+            handles,
+        );
     }
 
     #[test]
@@ -809,7 +875,29 @@ mod drone_tests {
             drones: controller_drones,
             _node_event_recv: node_event_recv,
         };
-        crash_drones_and_wait_join(controller, handles);
+
+        let senders = vec![d_send, d12_send];
+        crash_drones_and_wait_join(
+            controller,
+            senders,
+            Config {
+                drone: vec![
+                    wg_2024::config::Drone {
+                        id: 11,
+                        connected_node_ids: vec![12, 1],
+                        pdr: 0.0,
+                    },
+                    wg_2024::config::Drone {
+                        id: 12,
+                        connected_node_ids: vec![11, 21],
+                        pdr: 0.0,
+                    },
+                ],
+                client: vec![],
+                server: vec![],
+            },
+            handles,
+        );
     }
 
     #[test]
@@ -855,7 +943,7 @@ mod drone_tests {
                 nack_type: NackType::ErrorInRouting(41),
             }),
             routing_header: SourceRoutingHeader {
-                hop_index: 1,
+                hop_index: 2,
                 hops: vec![12, 11, 1],
             },
             session_id: 5,
@@ -904,11 +992,49 @@ mod drone_tests {
             _node_event_recv: node_event_recv,
         };
 
-        crash_drones_and_wait_join(controller, handles);
+        let senders = vec![d_send, d_send2];
+        crash_drones_and_wait_join(
+            controller,
+            senders,
+            Config {
+                drone: vec![wg_2024::config::Drone {
+                    id: 11,
+                    connected_node_ids: vec![80],
+                    pdr: 0.0,
+                }],
+                client: vec![],
+                server: vec![],
+            },
+            handles,
+        );
     }
 
     #[test]
     fn flood() {
+        fn build_topology(
+            self_id: NodeId,
+            path_traces: Vec<Vec<(NodeId, NodeType)>>,
+        ) -> HashMap<NodeId, HashSet<NodeId>> {
+            let mut topology = HashMap::new();
+
+            for path_trace in path_traces {
+                let mut last = self_id;
+                if topology.get(&last).is_none() {
+                    topology.insert(last, HashSet::new());
+                }
+                for (node_id, _) in path_trace {
+                    topology.get_mut(&last).unwrap().insert(node_id);
+                    if topology.get(&node_id).is_none() {
+                        topology.insert(node_id, HashSet::new());
+                    }
+                    topology.get_mut(&node_id).unwrap().insert(last);
+                    last = node_id;
+                }
+            }
+
+            topology
+        }
+
         let config = parse_config("src/test_configs/config_flood.toml");
 
         let mut controller_drones = HashMap::new();
@@ -926,7 +1052,7 @@ mod drone_tests {
         }
 
         let mut handles = Vec::new();
-        for drone in config.drone.into_iter() {
+        for drone in config.drone.clone().into_iter() {
             // controller
             let (controller_drone_send, controller_drone_recv) = unbounded();
             controller_drones.insert(drone.id, controller_drone_send);
@@ -1048,29 +1174,8 @@ mod drone_tests {
         topology.insert(22, HashSet::from([3]));
         assert_eq!(topology, build_topology(11, path_traces));
 
-        crash_drones_and_wait_join(controller, handles);
-    }
-    fn build_topology(
-        self_id: NodeId,
-        path_traces: Vec<Vec<(NodeId, NodeType)>>,
-    ) -> HashMap<NodeId, HashSet<NodeId>> {
-        let mut topology = HashMap::new();
-
-        for path_trace in path_traces {
-            let mut last = self_id;
-            if topology.get(&last).is_none() {
-                topology.insert(last, HashSet::new());
-            }
-            for (node_id, _) in path_trace {
-                topology.get_mut(&last).unwrap().insert(node_id);
-                if topology.get(&node_id).is_none() {
-                    topology.insert(node_id, HashSet::new());
-                }
-                topology.get_mut(&node_id).unwrap().insert(last);
-                last = node_id;
-            }
-        }
-
-        topology
+        drop(packet_channels);
+        drop(drone_send);
+        crash_drones_and_wait_join(controller, Vec::new(), config, handles);
     }
 }
