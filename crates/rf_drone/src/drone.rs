@@ -60,7 +60,7 @@ impl Drone for RustAndFurious {
     }
 
     fn run(&mut self) {
-        loop {
+        while !self.is_in_crash_behaviour {
             select_biased! {
                 recv(self.controller_recv) -> command => {
                     if let Ok(command) = command {
@@ -75,12 +75,9 @@ impl Drone for RustAndFurious {
                     }
                 }
             }
-            if self.is_in_crash_behaviour {
-                break;
-            }
         }
         loop {
-            match self.packet_recv.recv() {
+            match self.packet_recv.try_recv() {
                 Ok(packet) => {
                     self.process_packet(packet);
                 }
@@ -1132,38 +1129,16 @@ mod drone_tests {
         // client receives two flood response with the paths to se two servers
         let mut path_traces = Vec::new();
         let client_recv = packet_channels[&11].1.clone();
-        assert!(match client_recv.recv().unwrap().pack_type {
-            PacketType::FloodResponse(flood_response) => {
-                println!("{:?}", &flood_response.path_trace);
-                path_traces.push(flood_response.path_trace);
-                true
-            }
-            _ => false,
-        });
-        assert!(match client_recv.recv().unwrap().pack_type {
-            PacketType::FloodResponse(flood_response) => {
-                println!("{:?}", &flood_response.path_trace);
-                path_traces.push(flood_response.path_trace);
-                true
-            }
-            _ => false,
-        });
-        assert!(match client_recv.recv().unwrap().pack_type {
-            PacketType::FloodResponse(flood_response) => {
-                println!("{:?}", &flood_response.path_trace);
-                path_traces.push(flood_response.path_trace);
-                true
-            }
-            _ => false,
-        });
-        assert!(match client_recv.recv().unwrap().pack_type {
-            PacketType::FloodResponse(flood_response) => {
-                println!("{:?}", &flood_response.path_trace);
-                path_traces.push(flood_response.path_trace);
-                true
-            }
-            _ => false,
-        });
+        for _ in 0..4 {
+            assert!(match client_recv.recv().unwrap().pack_type {
+                PacketType::FloodResponse(flood_response) => {
+                    //println!("{:?}", &flood_response.path_trace);
+                    path_traces.push(flood_response.path_trace);
+                    true
+                }
+                _ => false,
+            });
+        }
         let mut topology: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
         topology.insert(11, HashSet::from([1]));
         topology.insert(1, HashSet::from([11, 2, 3]));
