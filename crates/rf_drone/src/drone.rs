@@ -77,7 +77,7 @@ impl Drone for RustAndFurious {
             }
         }
         loop {
-            match self.packet_recv.try_recv() {
+            match self.packet_recv.recv() {
                 Ok(packet) => {
                     self.process_packet(packet);
                 }
